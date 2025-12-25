@@ -1,6 +1,6 @@
-# Second Brain Tools
+# Ojas's Second Brain Tools
 
-Built in rust.
+Learning Rust. Building a CLI tool to help me manage my second brain.
 
 ```bash
 
