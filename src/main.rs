@@ -225,6 +225,16 @@ fn system_time_to_unix_timestamp(time: SystemTime) -> u64 {
         .as_secs()
 }
 
+fn encode_path_preserving_slashes(path: &Path) -> String {
+    path.components()
+        .map(|component| {
+            let s = component.as_os_str().to_string_lossy();
+            urlencoding::encode(&s).to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn get_file_metadata(path: &Path) -> Result<(u64, u64), Box<dyn Error>> {
     let metadata = fs::metadata(path)?;
     let modified = metadata.modified()?;
@@ -499,10 +509,7 @@ fn merge_bookmarks(
                         .unwrap_or("");
                     let relative_path = file_path.strip_prefix(base_path)
                         .unwrap_or(file_path);
-                    let encoded_path = relative_path
-                        .to_str()
-                        .map(|s| urlencoding::encode(s).to_string())
-                        .unwrap_or_default();
+                    let encoded_path = encode_path_preserving_slashes(relative_path);
 
                     if !existing_folder_hrefs.contains(&encoded_path) {
                         let (add_date, file_last_modified) = get_file_metadata(file_path)?;
@@ -527,10 +534,7 @@ fn merge_bookmarks(
                     .unwrap_or("");
                 let relative_path = file_path.strip_prefix(base_path)
                     .unwrap_or(file_path);
-                let encoded_path = relative_path
-                    .to_str()
-                    .map(|s| urlencoding::encode(s).to_string())
-                    .unwrap_or_default();
+                let encoded_path = encode_path_preserving_slashes(relative_path);
 
                 let (add_date, file_last_modified) = get_file_metadata(file_path)?;
                 folder_entries.push(BookmarkItem::Link(BookmarkEntry {
