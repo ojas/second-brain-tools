@@ -1,11 +1,12 @@
 // extern crate serde_json;
 
+use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::path::PathBuf;
 
 
 // fn dump_tree(node: &Value, indent: usize) {
@@ -18,6 +19,32 @@ use std::path::Path;
 //         }
 //     }
 // }
+
+// CLI Data Structures
+
+#[derive(Parser)]
+#[command(name = "second-brain-tools")]
+#[command(about = "A CLI tool for managing a second brain file system", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Parse tree JSON and output TSV format (path, size, timestamp)
+    Tree {
+        /// Path to the tree JSON file (generated with: tree -J --du -D --timefmt "%Y-%m-%d")
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Manage bookmarks (placeholder)
+    Bookmarks {
+        /// Optional file path for bookmarks
+        #[arg(value_name = "FILE")]
+        file: Option<PathBuf>,
+    },
+}
 
 // Data Structures
 
@@ -143,14 +170,7 @@ fn walk_tree_fullpath(node: &TreeNode, prefix: &str, indent: usize) {
     }
 }
 
-fn serde_json_dump() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
-        eprintln!("Usage: {} <filename>", args[0]);
-        std::process::exit(1);
-    }
-    let path = &args[1];
-
+fn handle_tree_command(path: &PathBuf) -> Result<(), Box<dyn Error>> {
     let tree: TreeList = read_tree_from_file(path)?;
     //walk_tree(&tree.node, 0);
     walk_tree_fullpath(&tree.node, "", 0);
@@ -165,32 +185,23 @@ fn serde_json_dump() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// i'm missing external create for serde_json - help me fix
+fn handle_bookmarks_command(file: &Option<PathBuf>) -> Result<(), Box<dyn Error>> {
+    println!("Bookmarks command (placeholder)");
+    if let Some(path) = file {
+        println!("File: {}", path.display());
+    } else {
+        println!("No file specified");
+    }
+    Ok(())
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // get filename from args - there's just one arg
-    // use serde_json to read the file into a serde_json::Value
-    // the JSON structure looks like this;
-    //
-    // ```json
-    
-    // ```
-    // there are always two top-level elements; the first is the root directory,
-    // the second is a report summary
-    // we want to recursively walk the tree starting from the first element
-    // and print out the names of all files and directories
+    let cli = Cli::parse();
 
-    // typed_example();
-    // test_example();
-    // serde_json_dump();
-    // let args: Vec<String> = env::args().collect();
-    // if args.len() != 2 {
-    //     eprintln!("Usage: {} <filename>", args[0]);
-    //     std::process::exit(1);
-    // }
-    // let filename = &args[1];
+    match &cli.command {
+        Commands::Tree { file } => handle_tree_command(file)?,
+        Commands::Bookmarks { file } => handle_bookmarks_command(file)?,
+    }
 
-    serde_json_dump()?;
-    
     Ok(())
 }
