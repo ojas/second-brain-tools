@@ -3,11 +3,12 @@
 use clap::{Parser, Subcommand};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::SystemTime;
 
 
@@ -54,6 +55,12 @@ enum Commands {
         #[arg(short, long)]
         recursive: bool,
     },
+    /// Process photo albums: copy bookmarked files and generate resized versions
+    Pixie {
+        /// Path to pixie.yaml config file (default: ./pixie.yaml)
+        #[arg(short, long, default_value = "pixie.yaml")]
+        config: PathBuf,
+    },
 }
 
 // Data Structures
@@ -89,6 +96,28 @@ struct ReportNode {
     size: u64,
     directories: u64,
     files: u64,
+}
+
+// Pixie Data Structures
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PixieConfig {
+    input_folder: String,
+    #[serde(default)]
+    folder_depth: Option<u32>,  // 0-64, None means unlimited
+    output_folder: String,
+    index_file_name: String,
+    resize_args: HashMap<String, String>,  // e.g. {"rs": "800x800>", "thumb": "200x200"}
+    #[serde(default)]
+    index_transform: String,  // unused for now
+}
+
+#[derive(Debug)]
+struct AlbumFolder {
+    path: PathBuf,
+    index_path: PathBuf,
+    album_name: String,  // Just the folder name
+    depth: u32,
 }
 
 #[test]
@@ -614,6 +643,297 @@ fn handle_bookmarks_command(
     Ok(())
 }
 
+// Pixie functionality
+
+fn expand_tilde_path(path: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let expanded = shellexpand::tilde(path);
+    Ok(PathBuf::from(expanded.as_ref()))
+}
+
+fn read_pixie_config(path: &Path) -> Result<PixieConfig, Box<dyn Error>> {
+    let content = fs::read_to_string(path)?;
+    let config: PixieConfig = serde_yaml::from_str(&content)?;
+
+    // Validate folder_depth
+    if let Some(depth) = config.folder_depth {
+        if depth > 64 {
+            return Err(format!("folder_depth must be between 0 and 64, got {}", depth).into());
+        }
+    }
+
+    Ok(config)
+}
+
+fn find_album_folders(
+    input_folder: &Path,
+    index_filename: &str,
+    max_depth: Option<u32>
+) -> Result<Vec<AlbumFolder>, Box<dyn Error>> {
+    let mut albums = Vec::new();
+    let mut queue = VecDeque::new();
+
+    // Start BFS with input folder at depth 0
+    queue.push_back((input_folder.to_path_buf(), 0u32));
+
+    while let Some((current_path, current_depth)) = queue.pop_front() {
+        // Check if this folder contains the index file
+        let index_path = current_path.join(index_filename);
+        if index_path.exists() && index_path.is_file() {
+            let album_name = current_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            albums.push(AlbumFolder {
+                path: current_path.clone(),
+                index_path,
+                album_name,
+                depth: current_depth,
+            });
+        }
+
+        // Continue traversing if within depth limit
+        if max_depth.is_none() || current_depth < max_depth.unwrap() {
+            // Read subdirectories
+            if let Ok(entries) = fs::read_dir(&current_path) {
+                for entry in entries {
+                    if let Ok(entry) = entry {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            // Skip hidden directories
+                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                if !name.starts_with('.') {
+                                    queue.push_back((path, current_depth + 1));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(albums)
+}
+
+fn extract_bookmark_files(items: &[BookmarkItem]) -> Vec<String> {
+    let mut hrefs = Vec::new();
+
+    for item in items {
+        match item {
+            BookmarkItem::Link(entry) => {
+                hrefs.push(entry.href.clone());
+            }
+            BookmarkItem::Folder(folder) => {
+                // Recursively extract from folder
+                hrefs.extend(extract_bookmark_files(&folder.entries));
+            }
+        }
+    }
+
+    hrefs
+}
+
+fn run_imagemagick_resize(
+    file_path: &Path,
+    suffix: &str,
+    resize_spec: &str
+) -> Result<(), Box<dyn Error>> {
+    // Build the ImageMagick command
+    // magick input.jpg -resize "{resize_spec}" -set filename:f "%t.{suffix}.%e" "%[filename:f]"
+    // The %e in filename:f gets evaluated to the extension, then %[filename:f] outputs that value
+    let filename_pattern = format!("%t.{}.%e", suffix);
+    let output_pattern = "%[filename:f]";
+
+    // Get the directory where the file is located to set as working directory
+    let file_dir = file_path.parent()
+        .ok_or("Failed to get parent directory of file")?;
+
+    // Get just the filename to pass to ImageMagick (since we're setting current_dir)
+    let filename = file_path.file_name()
+        .ok_or("Failed to get filename")?;
+
+    let output = Command::new("magick")
+        .arg(filename)  // Use just the filename since current_dir is set
+        .arg("-resize")
+        .arg(&resize_spec)
+        .arg("-set")
+        .arg("filename:f")
+        .arg(&filename_pattern)
+        .arg(&output_pattern)
+        .current_dir(file_dir)  // Set working directory to output folder
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ImageMagick resize failed for {}: {}", file_path.display(), stderr).into());
+    }
+
+    Ok(())
+}
+
+fn copy_and_resize_files(
+    bookmark_hrefs: &[String],
+    source_folder: &Path,
+    dest_folder: &Path,
+    resize_args: &HashMap<String, String>
+) -> Result<(), Box<dyn Error>> {
+    // Create destination folder
+    fs::create_dir_all(dest_folder)?;
+
+    let mut copied_count = 0;
+    let mut copied_files = Vec::new();
+
+    // Copy each file
+    for href in bookmark_hrefs {
+        // URL-decode the href
+        let decoded = match urlencoding::decode(href) {
+            Ok(s) => s.to_string(),
+            Err(e) => {
+                eprintln!("Warning: Failed to decode '{}': {}", href, e);
+                continue;
+            }
+        };
+
+        let source_path = source_folder.join(&decoded);
+
+        // Extract just the filename for destination
+        let filename = source_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&decoded);
+        let dest_path = dest_folder.join(filename);
+
+        // Copy file
+        match fs::copy(&source_path, &dest_path) {
+            Ok(_) => {
+                copied_count += 1;
+                copied_files.push(dest_path);
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to copy '{}': {}", source_path.display(), e);
+            }
+        }
+    }
+
+    println!("  Copied {} files", copied_count);
+
+    // Run ImageMagick resize operations on each copied file
+    if !resize_args.is_empty() && !copied_files.is_empty() {
+        for (suffix, resize_spec) in resize_args {
+            let mut resize_count = 0;
+            for file_path in &copied_files {
+                match run_imagemagick_resize(file_path, suffix, resize_spec) {
+                    Ok(_) => {
+                        resize_count += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to create '{}' version of '{}': {}",
+                                  suffix, file_path.display(), e);
+                    }
+                }
+            }
+            println!("  Created {} '{}' resized versions", resize_count, suffix);
+        }
+    }
+
+    Ok(())
+}
+
+fn process_album(
+    album: &AlbumFolder,
+    config: &PixieConfig
+) -> Result<(), Box<dyn Error>> {
+    println!("Processing album: {} (depth {})", album.album_name, album.depth);
+
+    // Read and parse index file
+    let index_content = fs::read_to_string(&album.index_path)?;
+    let bookmark_items = parse_existing_bookmarks(&index_content);
+
+    // Extract all file hrefs
+    let hrefs = extract_bookmark_files(&bookmark_items);
+    println!("  Found {} files in bookmarks", hrefs.len());
+
+    if hrefs.is_empty() {
+        println!("  Skipping: no files to process");
+        return Ok(());
+    }
+
+    // Create output folder using just the album name
+    let output_folder_path = expand_tilde_path(&config.output_folder)?;
+    let output_album_path = output_folder_path.join(&album.album_name);
+
+    // Copy files and create resized versions
+    copy_and_resize_files(&hrefs, &album.path, &output_album_path, &config.resize_args)?;
+
+    // Copy index file to output
+    let output_index_path = output_album_path.join(&config.index_file_name);
+    fs::copy(&album.index_path, &output_index_path)?;
+    println!("  Copied index file");
+
+    Ok(())
+}
+
+fn handle_pixie_command(config_path: &PathBuf) -> Result<(), Box<dyn Error>> {
+    // Check if ImageMagick is available
+    match Command::new("magick").arg("--version").output() {
+        Ok(output) if output.status.success() => {
+            // ImageMagick is available
+        }
+        _ => {
+            return Err("ImageMagick not found. Please install ImageMagick to use the pixie command.".into());
+        }
+    }
+
+    // Load config
+    println!("Loading config from: {}", config_path.display());
+    let config = read_pixie_config(config_path)?;
+
+    // Expand paths
+    let input_folder = expand_tilde_path(&config.input_folder)?;
+
+    // Validate input folder exists
+    if !input_folder.exists() || !input_folder.is_dir() {
+        return Err(format!("Input folder does not exist: {}", input_folder.display()).into());
+    }
+
+    // Find all album folders
+    println!("Searching for albums in: {}", input_folder.display());
+    let albums = find_album_folders(&input_folder, &config.index_file_name, config.folder_depth)?;
+
+    println!("Found {} album folders\n", albums.len());
+
+    if albums.is_empty() {
+        println!("No albums found with index file '{}'", config.index_file_name);
+        return Ok(());
+    }
+
+    // Process each album
+    let mut success_count = 0;
+    let mut failure_count = 0;
+
+    for album in &albums {
+        match process_album(album, &config) {
+            Ok(_) => {
+                success_count += 1;
+            }
+            Err(e) => {
+                eprintln!("Error processing album '{}': {}", album.album_name, e);
+                failure_count += 1;
+            }
+        }
+        println!();  // Blank line between albums
+    }
+
+    // Print summary
+    println!("Summary:");
+    println!("  Total albums: {}", albums.len());
+    println!("  Successful: {}", success_count);
+    println!("  Failed: {}", failure_count);
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
@@ -622,6 +942,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Commands::Bookmarks { folder, index, recursive } => {
             handle_bookmarks_command(folder, index, *recursive)?
         }
+        Commands::Pixie { config } => handle_pixie_command(config)?,
     }
 
     Ok(())
