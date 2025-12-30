@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build:*)",
+      "Bash(./target/debug/second-brain-tools bookmarks:*)",
+      "Bash(gh issue view:*)",
+      "Bash(./target/debug/second-brain-tools pixie:*)",
+      "Bash(cargo run:*)"
+    ]
+  }
+}

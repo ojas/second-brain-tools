@@ -120,6 +120,37 @@ struct AlbumFolder {
     depth: u32,
 }
 
+// Index YAML/JSON data structures
+
+#[derive(Serialize, Deserialize, Debug)]
+struct AlbumIndex {
+    title: String,
+    photos: Vec<PhotoInfo>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PhotoInfo {
+    filename: String,
+    w: Option<u32>,
+    h: Option<u32>,
+    caption: Option<String>,
+    sizes: HashMap<String, SizeInfo>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct SizeInfo {
+    filename: String,
+    w: Option<u32>,
+    h: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct BookmarkFile {
+    href: String,
+    name: String,
+    caption: Option<String>,
+}
+
 #[test]
 fn test_textbook_example() -> Result<(), Box<dyn Error>> {
     // Some JSON input data as a &str. Maybe this comes from the user.
@@ -313,6 +344,15 @@ fn scan_directory(
     dirs.sort();
 
     Ok((files, dirs))
+}
+
+fn extract_title_from_bookmarks(content: &str) -> String {
+    let title_re = Regex::new(r"<H1>(.*?)</H1>").unwrap();
+    if let Some(cap) = title_re.captures(content) {
+        cap.get(1).map(|m| m.as_str().to_string()).unwrap_or_else(|| "Untitled".to_string())
+    } else {
+        "Untitled".to_string()
+    }
 }
 
 fn parse_existing_bookmarks(content: &str) -> Vec<BookmarkItem> {
@@ -645,6 +685,19 @@ fn handle_bookmarks_command(
 
 // Pixie functionality
 
+fn log_command(cmd: &Command) {
+    let program = cmd.get_program().to_string_lossy();
+    let args: Vec<String> = cmd.get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect();
+
+    if args.is_empty() {
+        eprintln!("[CMD] {}", program);
+    } else {
+        eprintln!("[CMD] {} {}", program, args.join(" "));
+    }
+}
+
 fn expand_tilde_path(path: &str) -> Result<PathBuf, Box<dyn Error>> {
     let expanded = shellexpand::tilde(path);
     Ok(PathBuf::from(expanded.as_ref()))
@@ -717,22 +770,26 @@ fn find_album_folders(
     Ok(albums)
 }
 
-fn extract_bookmark_files(items: &[BookmarkItem]) -> Vec<String> {
-    let mut hrefs = Vec::new();
+fn extract_bookmark_files(items: &[BookmarkItem]) -> Vec<BookmarkFile> {
+    let mut files = Vec::new();
 
     for item in items {
         match item {
             BookmarkItem::Link(entry) => {
-                hrefs.push(entry.href.clone());
+                files.push(BookmarkFile {
+                    href: entry.href.clone(),
+                    name: entry.name.clone(),
+                    caption: entry.description.clone(),
+                });
             }
             BookmarkItem::Folder(folder) => {
                 // Recursively extract from folder
-                hrefs.extend(extract_bookmark_files(&folder.entries));
+                files.extend(extract_bookmark_files(&folder.entries));
             }
         }
     }
 
-    hrefs
+    files
 }
 
 fn run_imagemagick_resize(
@@ -754,16 +811,19 @@ fn run_imagemagick_resize(
     let filename = file_path.file_name()
         .ok_or("Failed to get filename")?;
 
-    let output = Command::new("magick")
-        .arg(filename)  // Use just the filename since current_dir is set
+    let mut cmd = Command::new("magick");
+    cmd.arg(filename)  // Use just the filename since current_dir is set
+        .arg("-auto-orient")  // Rotate pixels to match EXIF, strip orientation tag
         .arg("-resize")
         .arg(&resize_spec)
         .arg("-set")
         .arg("filename:f")
         .arg(&filename_pattern)
         .arg(&output_pattern)
-        .current_dir(file_dir)  // Set working directory to output folder
-        .output()?;
+        .current_dir(file_dir);  // Set working directory to output folder
+
+    log_command(&cmd);
+    let output = cmd.output()?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -774,7 +834,7 @@ fn run_imagemagick_resize(
 }
 
 fn copy_and_resize_files(
-    bookmark_hrefs: &[String],
+    bookmark_files: &[BookmarkFile],
     source_folder: &Path,
     dest_folder: &Path,
     resize_args: &HashMap<String, String>
@@ -786,12 +846,12 @@ fn copy_and_resize_files(
     let mut copied_files = Vec::new();
 
     // Copy each file
-    for href in bookmark_hrefs {
+    for file in bookmark_files {
         // URL-decode the href
-        let decoded = match urlencoding::decode(href) {
+        let decoded = match urlencoding::decode(&file.href) {
             Ok(s) => s.to_string(),
             Err(e) => {
-                eprintln!("Warning: Failed to decode '{}': {}", href, e);
+                eprintln!("Warning: Failed to decode '{}': {}", file.href, e);
                 continue;
             }
         };
@@ -840,6 +900,126 @@ fn copy_and_resize_files(
     Ok(())
 }
 
+fn get_image_dimensions(folder: &Path) -> Result<HashMap<String, (u32, u32)>, Box<dyn Error>> {
+    // Run: magick identify -format "%f,%w,%h\n" folder/*
+    let pattern = folder.join("*");
+    let pattern_str = pattern.to_str()
+        .ok_or("Failed to convert path to string")?;
+
+    let mut cmd = Command::new("magick");
+    cmd.arg("identify")
+        .arg("-format")
+        .arg("%f,%w,%h\\n")
+        .arg(pattern_str);
+
+    log_command(&cmd);
+    let output = cmd.output()?;
+
+    // Parse stdout regardless of exit code - ImageMagick may partially succeed
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut dimensions = HashMap::new();
+
+    // Parse CSV output: filename,width,height
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() == 3 {
+            if let (Some(filename), Some(width), Some(height)) = (
+                parts.get(0),
+                parts.get(1).and_then(|s| s.parse::<u32>().ok()),
+                parts.get(2).and_then(|s| s.parse::<u32>().ok()),
+            ) {
+                dimensions.insert(filename.to_string(), (width, height));
+            }
+        }
+    }
+
+    // Log warnings if there were errors, but don't fail if we got some results
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.is_empty() {
+            eprintln!("Warning: magick identify had errors (but may have partial results): {}", stderr);
+        }
+
+        // Only fail if we got no results at all
+        if dimensions.is_empty() {
+            return Err(format!("magick identify failed to process any files: {}", stderr).into());
+        }
+    }
+
+    Ok(dimensions)
+}
+
+fn build_album_index(
+    title: String,
+    bookmark_files: &[BookmarkFile],
+    dimensions: &HashMap<String, (u32, u32)>,
+    resize_args: &HashMap<String, String>,
+) -> AlbumIndex {
+    // Note on orientation handling:
+    // - Original files: Copied as-is, preserve EXIF orientation data
+    //   Dimensions reported are physical (may not match visual if rotated)
+    // - Resized files: Auto-oriented during resize (-auto-orient flag)
+    //   Pixels are rotated to match EXIF, orientation tag is stripped
+    //   Dimensions reported match visual appearance
+    // This ensures resized images display correctly on the web while preserving originals
+
+    let mut photos = Vec::new();
+
+    for file in bookmark_files {
+        // Decode href to get the actual filename
+        let decoded = urlencoding::decode(&file.href)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| file.href.clone());
+
+        // Extract just the filename
+        let filename = Path::new(&decoded)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&decoded)
+            .to_string();
+
+        // Get dimensions for original file
+        let (w, h) = dimensions.get(&filename)
+            .map(|(w, h)| (Some(*w), Some(*h)))
+            .unwrap_or((None, None));
+
+        // Build sizes map
+        let mut sizes = HashMap::new();
+        for (suffix, _) in resize_args {
+            let resized_filename = format!(
+                "{}.{}.{}",
+                Path::new(&filename).file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(""),
+                suffix,
+                Path::new(&filename).extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+            );
+
+            let (size_w, size_h) = dimensions.get(&resized_filename)
+                .map(|(w, h)| (Some(*w), Some(*h)))
+                .unwrap_or((None, None));
+
+            sizes.insert(suffix.clone(), SizeInfo {
+                filename: resized_filename,
+                w: size_w,
+                h: size_h,
+            });
+        }
+
+        photos.push(PhotoInfo {
+            filename,
+            w,
+            h,
+            caption: file.caption.clone(),
+            sizes,
+        });
+    }
+
+    AlbumIndex { title, photos }
+}
+
 fn process_album(
     album: &AlbumFolder,
     config: &PixieConfig
@@ -848,13 +1028,17 @@ fn process_album(
 
     // Read and parse index file
     let index_content = fs::read_to_string(&album.index_path)?;
+
+    // Extract title from H1
+    let title = extract_title_from_bookmarks(&index_content);
+
     let bookmark_items = parse_existing_bookmarks(&index_content);
 
-    // Extract all file hrefs
-    let hrefs = extract_bookmark_files(&bookmark_items);
-    println!("  Found {} files in bookmarks", hrefs.len());
+    // Extract all file hrefs with captions
+    let bookmark_files = extract_bookmark_files(&bookmark_items);
+    println!("  Found {} files in bookmarks", bookmark_files.len());
 
-    if hrefs.is_empty() {
+    if bookmark_files.is_empty() {
         println!("  Skipping: no files to process");
         return Ok(());
     }
@@ -864,24 +1048,51 @@ fn process_album(
     let output_album_path = output_folder_path.join(&album.album_name);
 
     // Copy files and create resized versions
-    copy_and_resize_files(&hrefs, &album.path, &output_album_path, &config.resize_args)?;
+    copy_and_resize_files(&bookmark_files, &album.path, &output_album_path, &config.resize_args)?;
 
     // Copy index file to output
     let output_index_path = output_album_path.join(&config.index_file_name);
     fs::copy(&album.index_path, &output_index_path)?;
     println!("  Copied index file");
 
+    // Get image dimensions for all files in the output folder
+    println!("  Getting image dimensions...");
+    let dimensions = match get_image_dimensions(&output_album_path) {
+        Ok(dims) => dims,
+        Err(e) => {
+            eprintln!("Warning: Failed to get image dimensions: {}", e);
+            HashMap::new()
+        }
+    };
+
+    // Build album index
+    let album_index = build_album_index(title, &bookmark_files, &dimensions, &config.resize_args);
+
+    // Serialize to YAML
+    let yaml_content = serde_yaml::to_string(&album_index)?;
+    let yaml_path = output_album_path.join("index.yaml");
+    fs::write(&yaml_path, yaml_content)?;
+    println!("  Generated index.yaml with {} photos", album_index.photos.len());
+
     Ok(())
 }
 
 fn handle_pixie_command(config_path: &PathBuf) -> Result<(), Box<dyn Error>> {
     // Check if ImageMagick is available
-    match Command::new("magick").arg("--version").output() {
+    let mut version_cmd = Command::new("magick");
+    version_cmd.arg("--version");
+
+    log_command(&version_cmd);
+    match version_cmd.output() {
         Ok(output) if output.status.success() => {
             // ImageMagick is available
         }
-        _ => {
-            return Err("ImageMagick not found. Please install ImageMagick to use the pixie command.".into());
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("ImageMagick check failed: {}", stderr).into());
+        }
+        Err(e) => {
+            return Err(format!("ImageMagick not found: {}. Please install ImageMagick to use the pixie command.", e).into());
         }
     }
 

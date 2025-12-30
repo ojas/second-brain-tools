@@ -1,0 +1,8 @@
+  input_folder: ./examples/100_FUJI
+  folder_depth: 2  # Optional: 0-64 or omit for unlimited
+  output_folder: ./examples/cdn
+  index_file_name: index.html
+  resize_args:
+    rs: "800x800>"
+    thumb: "200x200>"
+  index_transform: ""  # Unused for now
