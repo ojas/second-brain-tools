@@ -61,6 +61,16 @@ enum Commands {
         #[arg(short, long, default_value = "pixie.yaml")]
         config: PathBuf,
     },
+    /// Convert Obsidian vault to publishable markdown
+    Vault {
+        /// Path to the vault directory to process
+        #[arg(value_name = "VAULT_DIR")]
+        vault_dir: PathBuf,
+
+        /// Output directory for processed files
+        #[arg(short, long, value_name = "OUTPUT_DIR")]
+        output_dir: PathBuf,
+    },
 }
 
 // Data Structures
@@ -1145,6 +1155,219 @@ fn handle_pixie_command(config_path: &PathBuf) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// Vault functionality
+
+fn parse_frontmatter(content: &str) -> Result<(HashMap<String, serde_yaml::Value>, String), Box<dyn Error>> {
+    // Check if content starts with frontmatter delimiter
+    if !content.starts_with("---\n") && !content.starts_with("---\r\n") {
+        return Ok((HashMap::new(), content.to_string()));
+    }
+
+    // Find the closing delimiter
+    let after_first = if content.starts_with("---\r\n") {
+        &content[5..]
+    } else {
+        &content[4..]
+    };
+
+    if let Some(end_pos) = after_first.find("\n---\n").or_else(|| after_first.find("\n---\r\n")) {
+        let yaml_section = &after_first[..end_pos];
+        let content_section = if after_first[end_pos..].starts_with("\n---\r\n") {
+            &after_first[end_pos + 6..]
+        } else {
+            &after_first[end_pos + 5..]
+        };
+
+        // Parse YAML frontmatter
+        let metadata: HashMap<String, serde_yaml::Value> = serde_yaml::from_str(yaml_section)
+            .unwrap_or_else(|_| HashMap::new());
+
+        Ok((metadata, content_section.to_string()))
+    } else {
+        // No closing delimiter found, treat as no frontmatter
+        Ok((HashMap::new(), content.to_string()))
+    }
+}
+
+fn build_vault_index(vault_dir: &Path) -> Result<HashMap<String, PathBuf>, Box<dyn Error>> {
+    let mut index = HashMap::new();
+
+    fn walk_dir(dir: &Path, vault_root: &Path, index: &mut HashMap<String, PathBuf>) -> Result<(), Box<dyn Error>> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if path.is_dir() {
+                walk_dir(&path, vault_root, index)?;
+            } else if path.is_file() {
+                if let Some(ext) = path.extension() {
+                    if ext == "md" {
+                        if let Some(stem) = path.file_stem() {
+                            let basename = stem.to_string_lossy().to_string();
+                            let relative = path.strip_prefix(vault_root)
+                                .unwrap_or(&path)
+                                .with_extension("");
+                            index.insert(basename, relative);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    walk_dir(vault_dir, vault_dir, &mut index)?;
+    Ok(index)
+}
+
+fn convert_wikilinks(content: &str, index: &HashMap<String, PathBuf>) -> String {
+    let wikilink_re = Regex::new(r"\[\[([^\]]+)\]\]").unwrap();
+
+    wikilink_re.replace_all(content, |caps: &regex::Captures| {
+        let target = caps[1].trim();
+
+        // Handle aliases [[target|alias]]
+        let (link_target, display_text) = if let Some(pipe_pos) = target.find('|') {
+            let (t, a) = target.split_at(pipe_pos);
+            (t.trim(), a[1..].trim())
+        } else {
+            (target, target)
+        };
+
+        // Look up target in index
+        let href = index.get(link_target)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| link_target.to_string());
+
+        format!("[{}]({})", display_text, href)
+    }).to_string()
+}
+
+fn process_vault_file(
+    input_path: &Path,
+    output_path: &Path,
+    index: &HashMap<String, PathBuf>
+) -> Result<(), Box<dyn Error>> {
+    let content = fs::read_to_string(input_path)?;
+    let (metadata, body) = parse_frontmatter(&content)?;
+
+    // Check if file should be published
+    let should_publish = metadata.get("publish")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if !should_publish {
+        return Ok(());
+    }
+
+    // Convert wikilinks in body
+    let converted_body = convert_wikilinks(&body, index);
+
+    // Rebuild frontmatter without 'publish' key
+    let mut output = String::new();
+
+    if !metadata.is_empty() {
+        let filtered: HashMap<&str, &serde_yaml::Value> = metadata.iter()
+            .filter(|(k, _)| k.as_str() != "publish")
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+
+        if !filtered.is_empty() {
+            output.push_str("---\n");
+            for (key, value) in filtered {
+                output.push_str(&format!("{}: {}\n", key, serde_yaml::to_string(value)?.trim()));
+            }
+            output.push_str("---\n\n");
+        }
+    }
+
+    output.push_str(&converted_body);
+
+    // Create parent directories and write file
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(output_path, output)?;
+
+    Ok(())
+}
+
+fn handle_vault_command(vault_dir: &PathBuf, output_dir: &PathBuf) -> Result<(), Box<dyn Error>> {
+    // Expand tilde in paths
+    let vault_dir = expand_tilde_path(&vault_dir.to_string_lossy())?;
+    let output_dir = expand_tilde_path(&output_dir.to_string_lossy())?;
+
+    // Validate vault directory exists
+    if !vault_dir.is_dir() {
+        return Err(format!("Vault directory does not exist: {}", vault_dir.display()).into());
+    }
+
+    // Clean output directory if it exists
+    if output_dir.exists() {
+        fs::remove_dir_all(&output_dir)?;
+    }
+    fs::create_dir_all(&output_dir)?;
+
+    // Build index of all markdown files
+    println!("Building vault index...");
+    let index = build_vault_index(&vault_dir)?;
+    println!("Found {} markdown files", index.len());
+
+    // Walk vault and process each file
+    println!("Processing files...");
+    let mut processed_count = 0;
+    let mut skipped_count = 0;
+
+    fn walk_and_process(
+        dir: &Path,
+        vault_root: &Path,
+        output_root: &Path,
+        index: &HashMap<String, PathBuf>,
+        processed: &mut usize,
+        skipped: &mut usize
+    ) -> Result<(), Box<dyn Error>> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if path.is_dir() {
+                walk_and_process(&path, vault_root, output_root, index, processed, skipped)?;
+            } else if path.is_file() {
+                if let Some(ext) = path.extension() {
+                    if ext == "md" {
+                        let rel_path = path.strip_prefix(vault_root).unwrap_or(&path);
+                        let output_path = output_root.join(rel_path);
+
+                        match process_vault_file(&path, &output_path, index) {
+                            Ok(_) => {
+                                if output_path.exists() {
+                                    *processed += 1;
+                                } else {
+                                    *skipped += 1;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Warning: Failed to process {}: {}", path.display(), e);
+                                *skipped += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    walk_and_process(&vault_dir, &vault_dir, &output_dir, &index, &mut processed_count, &mut skipped_count)?;
+
+    println!("\nDone!");
+    println!("Processed: {}", processed_count);
+    println!("Skipped: {}", skipped_count);
+    println!("Output directory: {}", output_dir.display());
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
@@ -1154,6 +1377,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             handle_bookmarks_command(folder, index, *recursive)?
         }
         Commands::Pixie { config } => handle_pixie_command(config)?,
+        Commands::Vault { vault_dir, output_dir } => {
+            handle_vault_command(vault_dir, output_dir)?
+        }
     }
 
     Ok(())
