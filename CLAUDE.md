@@ -176,7 +176,7 @@ Generates publishable markdown files with:
 - Directory structure maintained from vault
 
 **Behavior:**
-- Only processes files with `publish: true` in YAML frontmatter
+- Only processes files with `publish: true` in YAML frontmatter (strict boolean `true`, not truthy values)
 - Builds basename-to-path index for efficient link resolution
 - Converts Obsidian-style `[[wikilinks]]` to standard markdown links
 - Handles wikilink aliases with pipe syntax (`[[link|display text]]`)
@@ -188,7 +188,8 @@ Generates publishable markdown files with:
 
 **Frontmatter Handling:**
 - Parses YAML frontmatter delimited by `---` markers
-- Checks for `publish` boolean field to determine if file should be processed
+- Checks for `publish` field with strict boolean value `true` (not "true" string, not 1, not yes/no)
+- Files without `publish: true` are skipped entirely (no output generated)
 - Strips `publish` key from output while preserving other metadata
 - Gracefully handles files without frontmatter (treated as unpublished)
 

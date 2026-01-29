@@ -47,5 +47,6 @@ target/debug/second-brain-tools vault ~/Projects/my-vault -o ~/site/content
 ## Notes
 
 - [crates.io](https://crates.io/) token stored locally in `.crates_io_token`. Take care.
-- Vault command only processes files with `publish: true` in frontmatter
+- Vault command only processes files with `publish: true` in frontmatter (strict boolean, not truthy values)
 - Vault command converts `[[wikilinks]]` to standard markdown links
+- Vault paths support tilde expansion (`~/path/to/vault`)
