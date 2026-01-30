@@ -9,6 +9,7 @@ A Rust CLI tool for managing a "second brain" file system. The tool provides mul
 - `bookmarks`: Generates and syncs Netscape-style bookmark HTML index files for directories, preserving existing bookmarks and descriptions while adding new files
 - `pixie`: Processes photo albums by copying bookmarked files to output folders, generating resized versions with ImageMagick, and creating index.yaml metadata files
 - `vault`: Converts Obsidian vault markdown files to publishable format by transforming wikilinks and filtering by frontmatter publish flags
+- `quotes-gr`: Fetches Goodreads quotes RSS feeds and generates markdown files with YAML frontmatter for each quote
 
 ## Development Commands
 
@@ -71,6 +72,27 @@ target/debug/second-brain-tools vault ~/Projects/my-vault --output-dir ~/Project
 
 # Short form
 target/debug/second-brain-tools vault ~/Projects/my-vault -o ~/site/content
+
+# Run quotes-gr subcommand
+# Fetch Goodreads RSS and generate markdown files (default output: QUOTES/)
+cargo run -- quotes-gr
+target/debug/second-brain-tools quotes-gr
+
+# Use custom RSS feed URL and output directory
+cargo run -- quotes-gr --feed-url https://www.goodreads.com/quotes/list_rss/USER_ID --out-dir ~/quotes
+target/debug/second-brain-tools quotes-gr --feed-url https://example.com/feed.rss --out-dir /path/to/output
+
+# Use local RSS file instead of URL
+target/debug/second-brain-tools quotes-gr --feed-url examples/goodreads/136615714-ojas.rss --out-dir QUOTES
+
+# Limit processing to first N items
+target/debug/second-brain-tools quotes-gr --limit 10
+
+# Dry run mode - preview without writing files
+target/debug/second-brain-tools quotes-gr --dry-run
+
+# Overwrite existing files
+target/debug/second-brain-tools quotes-gr --overwrite
 ```
 
 ## Code Architecture
@@ -200,11 +222,51 @@ Generates publishable markdown files with:
 - Omits `.md` extension in output links
 - Preserves relative path structure in converted links
 
+### Quotes-GR Subcommand
+
+**Input Format:**
+- RSS feed URL (default: `https://www.goodreads.com/quotes/list_rss/136615714-ojas`)
+- Can also accept local file path to RSS file
+- Expects standard RSS 2.0 format with `<item>` elements
+
+**Output Format:**
+Generates one markdown file per RSS item with:
+- YAML frontmatter containing:
+  - `kind`: Always set to "quote"
+  - `source_feed_url`: The RSS feed URL or file path
+  - `added_at`: ISO8601 timestamp converted from RSS pubDate (RFC 2822 format)
+  - `item_guid`: The item's GUID from RSS
+  - `item_link`: The item's link URL from RSS
+  - `title`: The item's title with escaped quotes
+- Markdown body: Item description with CDATA extracted, HTML entities decoded, and whitespace trimmed
+
+**Filename Generation:**
+- Derived from the "filepart" of item.guid
+- If guid is a URL: extracts last non-empty path segment (e.g., `https://example.com/quotes/12345` → `12345.md`)
+- If guid is not a URL: uses entire guid string
+- Sanitizes invalid filename characters (replacing `/\:*?"<>|` with `-`)
+- Appends `.md` extension
+
+**Behavior:**
+- Fetches RSS from URL using `reqwest` or reads from local file path
+- Only processes items whose guid or link contains `/quotes/` (filter)
+- Skips existing files unless `--overwrite` flag is specified
+- Supports `--dry-run` mode to preview without writing files
+- Supports `--limit` to process only first N items
+- Reports summary of processed, skipped, and errored items
+
+**Command Options:**
+- `--feed-url`: RSS feed URL or local file path (default: Goodreads ojas feed)
+- `--out-dir`: Output directory for markdown files (default: `QUOTES`)
+- `--overwrite`: Overwrite existing files (default: skip existing)
+- `--dry-run`: Preview mode without writing files
+- `--limit`: Limit number of items to process
+
 ### Key Data Structures (src/main.rs)
 
 **CLI Structures:**
 - `Cli`: Main CLI parser struct using clap's derive API
-- `Commands`: Enum defining available subcommands (Tree, Bookmarks, Pixie, Vault)
+- `Commands`: Enum defining available subcommands (Tree, Bookmarks, Pixie, Vault, QuotesGr)
 
 **Tree Data Structures:**
 - `TreeNode`: Recursive structure representing files/directories with `node_type`, `name`, `size`, `time`, and optional `contents` array
@@ -267,6 +329,11 @@ Note: `TreeNode.node_type` uses `#[serde(rename = "type")]` because "type" is a 
 - `convert_wikilinks()`: Transforms Obsidian `[[wikilink]]` syntax to standard markdown `[text](path)`, handles aliases
 - `process_vault_file()`: Processes single markdown file - parses frontmatter, checks publish flag, converts links, writes output
 
+**Quotes-GR Command:**
+- `handle_quotes_gr_command()`: Main handler - fetches RSS feed (URL or file), parses items, generates markdown files with frontmatter
+- `guid_to_filename()`: Converts RSS item GUID to safe filename by extracting last URL segment and sanitizing invalid characters
+- `pubdate_to_iso8601()`: Converts RFC 2822 pubDate format to ISO8601 format using chrono
+
 ## Dependencies
 
 - `serde` (with derive feature): For data structure serialization/deserialization
@@ -276,7 +343,10 @@ Note: `TreeNode.node_type` uses `#[serde(rename = "type")]` because "type" is a 
 - `regex`: For HTML parsing in bookmark files and wikilink conversion in vault
 - `urlencoding`: For URL-encoding file paths in bookmarks
 - `shellexpand`: For tilde (~) expansion in file paths
-- `chrono`: For timestamp handling (currently unused but available)
+- `chrono`: For timestamp parsing and ISO8601 conversion (quotes-gr pubDate conversion)
+- `rss`: For parsing RSS 2.0 feeds (quotes-gr command)
+- `reqwest` (with blocking feature): For fetching RSS feeds from URLs (quotes-gr command)
+- `html-escape`: For decoding HTML entities in RSS descriptions (quotes-gr command)
 
 **External Dependencies:**
 - `ImageMagick 7.x`: Required for pixie command (image resizing and dimension extraction)

@@ -71,6 +71,28 @@ enum Commands {
         #[arg(short, long, value_name = "OUTPUT_DIR")]
         output_dir: PathBuf,
     },
+    /// Fetch Goodreads quotes RSS and generate markdown files
+    QuotesGr {
+        /// RSS feed URL
+        #[arg(long, default_value = "https://www.goodreads.com/quotes/list_rss/136615714-ojas")]
+        feed_url: String,
+
+        /// Output directory for markdown files
+        #[arg(long, default_value = "QUOTES")]
+        out_dir: PathBuf,
+
+        /// Overwrite existing files
+        #[arg(long)]
+        overwrite: bool,
+
+        /// Dry run mode - don't write files
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Limit number of items to process
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 // Data Structures
@@ -216,6 +238,65 @@ fn test_typed_example() {
 
   // let nodes: Vec<Node> = serde_json::from_str(data).expect("JSON was not well-formatted");
 //   println!("{:#?}", tree.report.node_type);
+}
+
+#[test]
+fn test_guid_to_filename_url() {
+    // Test extracting last path segment from URL
+    let guid = "https://www.goodreads.com/quotes/8738820-being-happy-boils-down-to-three-things-something-to-do";
+    let result = guid_to_filename(guid);
+    assert_eq!(result, "8738820-being-happy-boils-down-to-three-things-something-to-do.md");
+}
+
+#[test]
+fn test_guid_to_filename_non_url() {
+    // Test using whole guid if not a URL
+    let guid = "some-unique-identifier-123";
+    let result = guid_to_filename(guid);
+    assert_eq!(result, "some-unique-identifier-123.md");
+}
+
+#[test]
+fn test_guid_to_filename_sanitize() {
+    // Test sanitizing invalid filename characters
+    let guid = "test:with*invalid?chars";
+    let result = guid_to_filename(guid);
+    assert_eq!(result, "test-with-invalid-chars.md");
+}
+
+#[test]
+fn test_guid_to_filename_trailing_slash() {
+    // Test URL with trailing slash - should use last non-empty segment
+    let guid = "https://example.com/path/to/item/";
+    let result = guid_to_filename(guid);
+    assert_eq!(result, "item.md");
+}
+
+#[test]
+fn test_pubdate_to_iso8601() {
+    // Test converting RFC 2822 to ISO8601
+    let pubdate = "Thu, 27 Nov 2025 20:43:59 -0800";
+    let result = pubdate_to_iso8601(pubdate).unwrap();
+    // Should be in ISO8601 format
+    assert!(result.starts_with("2025-11-"));
+    assert!(result.contains("T"));
+    assert!(result.contains("-08:00") || result.contains("-0800"));
+}
+
+#[test]
+fn test_pubdate_to_iso8601_different_timezone() {
+    // Test with different timezone
+    let pubdate = "Fri, 07 Mar 2025 07:23:23 -0800";
+    let result = pubdate_to_iso8601(pubdate).unwrap();
+    assert!(result.starts_with("2025-03-"));
+}
+
+#[test]
+fn test_pubdate_to_iso8601_invalid() {
+    // Test with invalid date format
+    let pubdate = "not a valid date";
+    let result = pubdate_to_iso8601(pubdate);
+    assert!(result.is_err());
 }
 
 fn read_tree_from_file<P: AsRef<Path>>(path: P) -> Result<TreeList,Box<dyn Error>> {
@@ -1249,7 +1330,7 @@ fn process_vault_file(
     index: &HashMap<String, PathBuf>
 ) -> Result<(), Box<dyn Error>> {
     let content = fs::read_to_string(input_path)?;
-    let (metadata, body) = parse_frontmatter(&content)?;
+    let (metadata, _body) = parse_frontmatter(&content)?;
 
     // Check if file should be published
     let should_publish = metadata.get("publish")
@@ -1260,34 +1341,14 @@ fn process_vault_file(
         return Ok(());
     }
 
-    // Convert wikilinks in body
-    let converted_body = convert_wikilinks(&body, index);
-
-    // Rebuild frontmatter without 'publish' key
-    let mut output = String::new();
-
-    if !metadata.is_empty() {
-        let filtered: HashMap<&str, &serde_yaml::Value> = metadata.iter()
-            .filter(|(k, _)| k.as_str() != "publish")
-            .map(|(k, v)| (k.as_str(), v))
-            .collect();
-
-        if !filtered.is_empty() {
-            output.push_str("---\n");
-            for (key, value) in filtered {
-                output.push_str(&format!("{}: {}\n", key, serde_yaml::to_string(value)?.trim()));
-            }
-            output.push_str("---\n\n");
-        }
-    }
-
-    output.push_str(&converted_body);
+    // Convert wikilinks in the entire content (preserves frontmatter exactly as-is)
+    let converted_content = convert_wikilinks(&content, index);
 
     // Create parent directories and write file
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(output_path, output)?;
+    fs::write(output_path, converted_content)?;
 
     Ok(())
 }
@@ -1341,6 +1402,7 @@ fn handle_vault_command(vault_dir: &PathBuf, output_dir: &PathBuf) -> Result<(),
                         match process_vault_file(&path, &output_path, index) {
                             Ok(_) => {
                                 if output_path.exists() {
+                                    println!("  ✓ {}", rel_path.display());
                                     *processed += 1;
                                 } else {
                                     *skipped += 1;
@@ -1368,6 +1430,166 @@ fn handle_vault_command(vault_dir: &PathBuf, output_dir: &PathBuf) -> Result<(),
     Ok(())
 }
 
+// Quotes-GR functionality
+
+fn guid_to_filename(guid: &str) -> String {
+    // If guid is a URL, extract the last path segment
+    // Otherwise use the whole guid
+    let filepart = if guid.starts_with("http://") || guid.starts_with("https://") {
+        let segments: Vec<&str> = guid.split('/').filter(|s| !s.is_empty()).collect();
+        segments
+            .last()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| guid.to_string())
+    } else {
+        guid.to_string()
+    };
+
+    // Sanitize filename by replacing invalid characters
+    let sanitized = filepart
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            _ => c,
+        })
+        .collect::<String>();
+
+    format!("{}.md", sanitized)
+}
+
+fn pubdate_to_iso8601(pubdate: &str) -> Result<String, Box<dyn Error>> {
+    use chrono::DateTime;
+
+    // Parse RFC 2822 format (e.g., "Thu, 27 Nov 2025 20:43:59 -0800")
+    let dt = DateTime::parse_from_rfc2822(pubdate)?;
+
+    // Convert to ISO8601 format
+    Ok(dt.to_rfc3339())
+}
+
+fn handle_quotes_gr_command(
+    feed_url: &str,
+    out_dir: &PathBuf,
+    overwrite: bool,
+    dry_run: bool,
+    limit: Option<usize>,
+) -> Result<(), Box<dyn Error>> {
+    println!("Fetching RSS feed from: {}", feed_url);
+
+    // Fetch RSS feed
+    let content = if feed_url.starts_with("http://") || feed_url.starts_with("https://") {
+        // Fetch from URL
+        let response = reqwest::blocking::get(feed_url)?;
+        response.text()?
+    } else {
+        // Treat as local file path
+        fs::read_to_string(feed_url)?
+    };
+
+    // Parse RSS
+    let channel = rss::Channel::read_from(content.as_bytes())?;
+
+    println!("Found {} items in feed", channel.items().len());
+
+    // Create output directory if it doesn't exist
+    if !dry_run {
+        fs::create_dir_all(out_dir)?;
+    }
+
+    let mut processed_count = 0;
+    let mut skipped_count = 0;
+    let mut error_count = 0;
+
+    // Process each item
+    for (idx, item) in channel.items().iter().enumerate() {
+        // Check limit
+        if let Some(lim) = limit {
+            if idx >= lim {
+                println!("Reached limit of {} items", lim);
+                break;
+            }
+        }
+
+        // Get guid and link
+        let guid = item.guid().map(|g| g.value()).unwrap_or("");
+        let link = item.link().unwrap_or("");
+
+        // Optional filter: only process items with /quotes/ in guid or link
+        if !guid.contains("/quotes/") && !link.contains("/quotes/") {
+            skipped_count += 1;
+            continue;
+        }
+
+        // Generate filename from guid
+        let filename = guid_to_filename(guid);
+        let file_path = out_dir.join(&filename);
+
+        // Skip if file exists and not overwriting
+        if !overwrite && file_path.exists() {
+            println!("  Skipping {} (already exists)", filename);
+            skipped_count += 1;
+            continue;
+        }
+
+        // Extract fields
+        let title = item.title().unwrap_or("");
+        let description = item.description().unwrap_or("");
+        let pubdate = item.pub_date().unwrap_or("");
+
+        // Convert pubDate to ISO8601
+        let added_at = match pubdate_to_iso8601(pubdate) {
+            Ok(iso) => iso,
+            Err(e) => {
+                eprintln!("Warning: Failed to parse pubDate '{}': {}", pubdate, e);
+                error_count += 1;
+                continue;
+            }
+        };
+
+        // Decode HTML entities in description and trim
+        let body = html_escape::decode_html_entities(description).trim().to_string();
+
+        // Build YAML frontmatter
+        let mut frontmatter = String::new();
+        frontmatter.push_str("---\n");
+        frontmatter.push_str("kind: quote\n");
+        frontmatter.push_str(&format!("source_feed_url: \"{}\"\n", feed_url));
+        frontmatter.push_str(&format!("added_at: \"{}\"\n", added_at));
+        frontmatter.push_str(&format!("item_guid: \"{}\"\n", guid));
+        frontmatter.push_str(&format!("item_link: \"{}\"\n", link));
+
+        // Escape quotes in title for YAML
+        let escaped_title = title.replace('"', "\\\"");
+        frontmatter.push_str(&format!("title: \"{}\"\n", escaped_title));
+        frontmatter.push_str("---\n\n");
+
+        // Build markdown content
+        let markdown = format!("{}{}", frontmatter, body);
+
+        if dry_run {
+            println!("  [DRY RUN] Would write: {}", filename);
+        } else {
+            // Write file
+            fs::write(&file_path, markdown)?;
+            println!("  Created: {}", filename);
+        }
+
+        processed_count += 1;
+    }
+
+    // Print summary
+    println!("\nSummary:");
+    println!("  Processed: {}", processed_count);
+    println!("  Skipped: {}", skipped_count);
+    println!("  Errors: {}", error_count);
+
+    if !dry_run {
+        println!("  Output directory: {}", out_dir.display());
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
@@ -1379,6 +1601,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Commands::Pixie { config } => handle_pixie_command(config)?,
         Commands::Vault { vault_dir, output_dir } => {
             handle_vault_command(vault_dir, output_dir)?
+        }
+        Commands::QuotesGr { feed_url, out_dir, overwrite, dry_run, limit } => {
+            handle_quotes_gr_command(feed_url, out_dir, *overwrite, *dry_run, *limit)?
         }
     }
 
